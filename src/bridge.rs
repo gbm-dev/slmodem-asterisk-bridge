@@ -3,11 +3,11 @@ use crate::ari_external_media::ExternalMediaRequest;
 use crate::config::Config;
 use crate::session::{Session, SessionState};
 use crate::slmodem::socket_from_raw_fd;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, instrument, warn, debug};
+use tracing::{info, instrument, warn};
 
 #[instrument(skip_all, fields(dial = %cfg.dial_string, media = %cfg.media_addr, fd = cfg.socket_fd))]
 pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()> {
@@ -21,7 +21,6 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let _ari_drain = tokio::spawn(drain_ari_events(ari_events));
 
     // Signal to slmodemd that the audio path is ready.
-    // We use a mutable local for the stream to allow looping.
     let mut sl_stream = sl_stream;
     sl_stream.writable().await?;
     sl_stream.write_all(b"\n").await?;
@@ -38,7 +37,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         let (read_half, mut write_half) = sl_stream.into_split();
         let mut reader = tokio::io::BufReader::new(read_half);
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
-        let mut dial_string = String::new();
+        let dial_string;
 
         // Loop generating silence until we get a dial string from slmodemd
         loop {
@@ -121,8 +120,6 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
             }
             Err(e) => {
                 warn!(error = %e, "media relay ended with error");
-                // If it failed, we can't easily recover the stream if it was consumed.
-                // But relay_media returns it now.
                 return Err(e);
             }
         }
@@ -138,7 +135,7 @@ async fn relay_media(
     >,
 ) -> Result<(tokio::net::UnixStream, u64, u64)> {
     let (mut ws_writer, mut ws_reader) = media_ws.split();
-    let (mut sl_reader, mut sl_writer) = tokio::io::split(sl_stream);
+    let (mut sl_reader, mut sl_writer) = sl_stream.into_split();
 
     let sl_to_ws = async {
         let mut total = 0u64;
@@ -178,18 +175,16 @@ async fn relay_media(
                 _ => {}
             }
         }
-        // Do NOT shutdown the socket if we want to reuse it for the next call!
-        // Instead, just return.
         Result::<u64>::Ok(total)
     };
 
     let (bytes_to_ws, bytes_to_sl) = tokio::try_join!(sl_to_ws, ws_to_sl).context("media relay failed")?;
     
     // Recover the stream parts
-    let sl_reader = sl_reader.reunite(sl_writer)
+    let sl_reunited = sl_reader.reunite(sl_writer)
         .map_err(|_| anyhow::anyhow!("failed to reunite sl_stream parts after relay"))?;
     
-    Ok((sl_reader, bytes_to_ws, bytes_to_sl))
+    Ok((sl_reunited, bytes_to_ws, bytes_to_sl))
 }
 
 async fn drain_ari_events(
