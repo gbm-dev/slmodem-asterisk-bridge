@@ -123,9 +123,15 @@ impl ExternalMediaRequest {
     }
 
     pub fn query_pairs(&self) -> Vec<(String, String)> {
+        let external_host = if self.connection_type.eq_ignore_ascii_case("server") {
+            "".to_string()
+        } else {
+            self.external_host.clone()
+        };
+
         let mut pairs = vec![
             ("app".to_string(), self.app.clone()),
-            ("external_host".to_string(), self.external_host.clone()),
+            ("external_host".to_string(), external_host),
             ("format".to_string(), self.format.clone()),
             ("transport".to_string(), self.transport.as_str().to_string()),
             (
