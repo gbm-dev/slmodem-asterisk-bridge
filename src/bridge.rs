@@ -3,9 +3,9 @@ use crate::ari_external_media::ExternalMediaRequest;
 use crate::config::Config;
 use crate::session::{Session, SessionState};
 use crate::slmodem::socket_from_raw_fd;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, instrument, warn};
 
@@ -21,9 +21,10 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let _ari_drain = tokio::spawn(drain_ari_events(ari_events));
 
     // Signal to slmodemd that the audio path is ready.
+    // We send 'R' (Ready) as the handshake character.
     let mut sl_stream = sl_stream;
     sl_stream.writable().await?;
-    sl_stream.write_all(b"\n").await?;
+    sl_stream.write_all(b"R").await?;
     info!("event=sent_ready_to_slmodemd");
 
     // Give Asterisk a moment to register the Stasis app.
@@ -34,29 +35,46 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     loop {
         info!("event=waiting_for_dial_string");
         
-        let (read_half, mut write_half) = sl_stream.into_split();
-        let mut reader = tokio::io::BufReader::new(read_half);
+        let (mut read_half, mut write_half) = sl_stream.into_split();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
-        let dial_string;
+        let mut dial_string = String::new();
+        let mut line_buf = Vec::new();
 
-        // Loop generating silence until we get a dial string from slmodemd
-        loop {
-            let mut line = String::new();
+        // Loop generating silence until we get a dial string from slmodemd.
+        // We MUST continuously read from read_half to drain any audio slmodemd
+        // might be sending, otherwise slmodemd will block on write and deadlock.
+        'wait_for_dial: loop {
+            let mut buf = [0u8; 1024];
             tokio::select! {
-                res = reader.read_line(&mut line) => {
-                    match res {
+                res = read_half.read(&mut buf) => {
+                    let n = match res {
                         Ok(0) => {
                             warn!("slmodemd closed the control socket");
                             return Ok(());
                         }
-                        Ok(_) => {
-                            let s = line.trim().to_string();
-                            if !s.is_empty() {
-                                dial_string = s;
-                                break;
+                        Ok(n) => n,
+                        Err(e) => return Err(e.into()),
+                    };
+                    
+                    // Process the bytes to look for the "DIAL:" prefix
+                    for &b in &buf[..n] {
+                        if b == b'\n' {
+                            let line = String::from_utf8_lossy(&line_buf);
+                            if let Some(ds) = line.strip_prefix("DIAL:") {
+                                let ds = ds.trim().to_string();
+                                if !ds.is_empty() {
+                                    dial_string = ds;
+                                    break 'wait_for_dial;
+                                }
+                            }
+                            line_buf.clear();
+                        } else {
+                            line_buf.push(b);
+                            // Prevent line_buf from growing indefinitely if no newline is found
+                            if line_buf.len() > 1024 {
+                                line_buf.clear();
                             }
                         }
-                        Err(e) => return Err(e.into()),
                     }
                 }
                 _ = interval.tick() => {
@@ -91,7 +109,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
             Err(err) => {
                 warn!(error = %err, "dial failed, returning to wait state");
                 // Reunite socket for next loop
-                sl_stream = reader.into_inner().reunite(write_half)
+                sl_stream = read_half.reunite(write_half)
                     .map_err(|_| anyhow::anyhow!("failed to reunite socket halves after dial failure"))?;
                 continue;
             }
@@ -102,8 +120,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         info!(dial = %session.dial(), state = ?session.state(), "event=bridge_start");
         let started = tokio::time::Instant::now();
 
-        // Reconstruct sl_stream from halves for relay_media
-        let sl_stream_reunited = reader.into_inner().reunite(write_half)
+        let sl_stream_reunited = read_half.reunite(write_half)
             .map_err(|_| anyhow::anyhow!("failed to reunite socket halves for relay"))?;
 
         match relay_media(sl_stream_reunited, media_ws).await {
