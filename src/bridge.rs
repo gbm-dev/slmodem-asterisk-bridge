@@ -37,6 +37,14 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         .connect_media_websocket(&media_setup.media_websocket_url, cfg.connect_timeout)
         .await?;
 
+    // --- CRITICAL SYNC POINT ---
+    // Signal to slmodemd that the audio path is ready.
+    // We write a single newline to the Unix socket. slmodemd will be
+    // blocking on a read until this arrives.
+    sl_stream.writable().await?;
+    sl_stream.try_write(b"\n")?;
+    info!("event=sent_ready_to_slmodemd");
+
     // Now dial the outbound call and bridge the channels.
     let call = match ari
         .dial_and_bridge(&cfg.dial_string, &media_request.app, &media_setup)
