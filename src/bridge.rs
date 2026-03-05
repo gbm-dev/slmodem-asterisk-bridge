@@ -24,8 +24,43 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let ari_events = ari.connect_events(&media_request.app).await?;
     let _ari_drain = tokio::spawn(drain_ari_events(ari_events));
 
-    let call = ari.start_call(&cfg.dial_string, &media_request).await?;
+    // Create the media channel and obtain its WebSocket URL first.
+    let media_setup = ari.setup_media(&media_request).await?;
     session.transition(SessionState::ConnectingMedia)?;
+
+    // Connect the media WebSocket before dialing so the media path is
+    // ready when audio starts flowing.
+    let (media_ws, _) = timeout(
+        cfg.connect_timeout,
+        connect_async(&media_setup.media_websocket_url),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out connecting to media websocket {}",
+            media_setup.media_websocket_url
+        )
+    })?
+    .with_context(|| {
+        format!(
+            "failed connecting to media websocket {}",
+            media_setup.media_websocket_url
+        )
+    })?;
+
+    info!(url = %media_setup.media_websocket_url, "event=media_ws_connected");
+
+    // Now dial the outbound call and bridge the channels.
+    let call = match ari
+        .dial_and_bridge(&cfg.dial_string, &media_request.app, &media_setup)
+        .await
+    {
+        Ok(call) => call,
+        Err(err) => {
+            // Media setup resources are cleaned up inside dial_and_bridge on error.
+            return Err(err);
+        }
+    };
 
     let result = async {
         session.transition(SessionState::MediaActive)?;
@@ -33,11 +68,9 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         let started = tokio::time::Instant::now();
 
         let (to_media, to_sl) =
-            relay_media_websocket(sl_stream, &call.media_websocket_url, cfg.connect_timeout)
-                .await
-                .with_context(|| {
-                    format!("failed to relay media via {}", call.media_websocket_url)
-                })?;
+            relay_media(sl_stream, media_ws).await.with_context(|| {
+                format!("failed to relay media via {}", call.media_websocket_url)
+            })?;
 
         let elapsed = started.elapsed().as_millis();
         session.transition(SessionState::Terminating)?;
@@ -59,26 +92,12 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     Ok(())
 }
 
-async fn relay_media_websocket(
+async fn relay_media(
     sl_stream: tokio::net::UnixStream,
-    media_websocket_url: &str,
-    connect_timeout: std::time::Duration,
+    media_ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
 ) -> Result<(u64, u64)> {
-    let (media_ws, _) = timeout(connect_timeout, connect_async(media_websocket_url))
-        .await
-        .with_context(|| {
-            format!(
-                "timed out connecting to media websocket {}",
-                media_websocket_url
-            )
-        })?
-        .with_context(|| {
-            format!(
-                "failed connecting to media websocket {}",
-                media_websocket_url
-            )
-        })?;
-
     let (mut ws_writer, mut ws_reader) = media_ws.split();
     let (mut sl_reader, mut sl_writer) = tokio::io::split(sl_stream);
 

@@ -10,6 +10,13 @@ use tracing::{debug, warn};
 use url::Url;
 
 #[derive(Debug, Clone)]
+pub struct MediaSetup {
+    pub bridge_id: String,
+    pub media_channel_id: String,
+    pub media_websocket_url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ActiveCall {
     pub bridge_id: String,
     pub outbound_channel_id: String,
@@ -106,16 +113,17 @@ impl AriController {
         Ok(stream)
     }
 
-    pub async fn start_call(
+    /// Set up the media channel and obtain its WebSocket URL, but do not
+    /// dial the outbound call yet.  This lets the caller establish the media
+    /// WebSocket connection before placing the PSTN call.
+    pub async fn setup_media(
         &self,
-        dial: &str,
         media_req: &ExternalMediaRequest,
-    ) -> Result<ActiveCall> {
+    ) -> Result<MediaSetup> {
         self.validate_media_mode(media_req)?;
 
         let bridge_id = unique_id("slmodem-bridge");
         let media_channel_id = unique_id("slmodem-media");
-        let outbound_channel_id = unique_id("slmodem-out");
 
         self.create_bridge(&bridge_id).await?;
         if let Err(err) = self
@@ -126,22 +134,61 @@ impl AriController {
             return Err(err);
         }
 
-        if let Err(err) = self
-            .create_and_dial_outbound(dial, &outbound_channel_id, &media_req.app)
+        let connection_id = match self
+            .wait_for_channel_variable(
+                &media_channel_id,
+                "MEDIA_WEBSOCKET_CONNECTION_ID",
+                Duration::from_secs(10),
+            )
             .await
         {
-            self.best_effort_hangup_channel(&media_channel_id).await;
-            self.best_effort_destroy_bridge(&bridge_id).await;
+            Ok(id) => id,
+            Err(err) => {
+                self.best_effort_hangup_channel(&media_channel_id).await;
+                self.best_effort_destroy_bridge(&bridge_id).await;
+                return Err(
+                    err.context("missing MEDIA_WEBSOCKET_CONNECTION_ID for media websocket connection"),
+                );
+            }
+        };
+        let media_websocket_url = self.media_websocket_url(&connection_id)?;
+
+        Ok(MediaSetup {
+            bridge_id,
+            media_channel_id,
+            media_websocket_url,
+        })
+    }
+
+    /// Dial the outbound call and bridge it with the already-created media
+    /// channel.  Call this after connecting to the media WebSocket.
+    pub async fn dial_and_bridge(
+        &self,
+        dial: &str,
+        app: &str,
+        setup: &MediaSetup,
+    ) -> Result<ActiveCall> {
+        let outbound_channel_id = unique_id("slmodem-out");
+
+        if let Err(err) = self
+            .create_and_dial_outbound(dial, &outbound_channel_id, app)
+            .await
+        {
+            self.best_effort_hangup_channel(&setup.media_channel_id).await;
+            self.best_effort_destroy_bridge(&setup.bridge_id).await;
             return Err(err);
         }
 
         if let Err(err) = self
-            .add_channels_to_bridge(&bridge_id, &[&outbound_channel_id, &media_channel_id])
+            .add_channels_to_bridge(
+                &setup.bridge_id,
+                &[&outbound_channel_id, &setup.media_channel_id],
+            )
             .await
         {
             self.best_effort_hangup_channel(&outbound_channel_id).await;
-            self.best_effort_hangup_channel(&media_channel_id).await;
-            self.best_effort_destroy_bridge(&bridge_id).await;
+            self.best_effort_hangup_channel(&setup.media_channel_id).await;
+            self.best_effort_destroy_bridge(&setup.bridge_id).await;
             return Err(err);
         }
 
@@ -150,26 +197,16 @@ impl AriController {
             .await
         {
             self.best_effort_hangup_channel(&outbound_channel_id).await;
-            self.best_effort_hangup_channel(&media_channel_id).await;
-            self.best_effort_destroy_bridge(&bridge_id).await;
+            self.best_effort_hangup_channel(&setup.media_channel_id).await;
+            self.best_effort_destroy_bridge(&setup.bridge_id).await;
             return Err(err);
         }
 
-        let connection_id = self
-            .wait_for_channel_variable(
-                &media_channel_id,
-                "MEDIA_WEBSOCKET_CONNECTION_ID",
-                Duration::from_secs(10),
-            )
-            .await
-            .context("missing MEDIA_WEBSOCKET_CONNECTION_ID for media websocket connection")?;
-        let media_websocket_url = self.media_websocket_url(&connection_id)?;
-
         Ok(ActiveCall {
-            bridge_id,
+            bridge_id: setup.bridge_id.clone(),
             outbound_channel_id,
-            media_channel_id,
-            media_websocket_url,
+            media_channel_id: setup.media_channel_id.clone(),
+            media_websocket_url: setup.media_websocket_url.clone(),
         })
     }
 
