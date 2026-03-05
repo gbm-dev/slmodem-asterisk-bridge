@@ -86,17 +86,32 @@ impl AriController {
         ws_url
             .query_pairs_mut()
             .clear()
-            .append_pair("app", app)
-            .append_pair("subscribeAll", "true");
+            .append_pair("app", app);
 
-        let (stream, _resp) = tokio_tungstenite::connect_async(ws_url.as_str())
-            .await
-            .with_context(|| {
-                format!("failed to connect ARI events websocket to {ws_url}")
-            })?;
-
-        debug!(app, url = %ws_url, "event=ari_events_connected");
-        Ok(stream)
+        let max_retries = 5;
+        let mut attempt = 0;
+        loop {
+            match tokio_tungstenite::connect_async(ws_url.as_str()).await {
+                Ok((stream, _resp)) => {
+                    debug!(app, url = %ws_url, "event=ari_events_connected");
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    attempt += 1;
+                    if attempt >= max_retries {
+                        return Err(anyhow::anyhow!(err))
+                            .with_context(|| format!("failed to connect ARI events websocket to {ws_url} after {max_retries} attempts"));
+                    }
+                    warn!(
+                        error = %err,
+                        attempt,
+                        max_retries,
+                        "event=ari_events_connect_retry",
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 
     /// Set up the media channel and obtain its WebSocket URL, but do not

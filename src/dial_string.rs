@@ -7,7 +7,7 @@ impl DialString {
     pub fn parse(input: &str) -> Result<Self> {
         let stripped = strip_tone_pulse_prefix(input);
         if stripped.is_empty() {
-            bail!("dial string is empty after stripping tone/pulse prefix");
+            return Ok(Self(String::new()));
         }
 
         if !stripped.chars().all(is_allowed_dial_char) {
@@ -15,6 +15,10 @@ impl DialString {
         }
 
         Ok(Self(stripped.to_string()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     pub fn as_str(&self) -> &str {

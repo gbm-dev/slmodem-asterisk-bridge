@@ -14,18 +14,46 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let mut session = Session::new(cfg.dial_string.clone());
     session.transition(SessionState::Originating)?;
 
-    let sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
+    let mut sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
     let ari = AriController::from_config(&cfg)?;
 
+    // --- CRITICAL SYNC POINT ---
     // Register the Stasis app by opening the ARI events WebSocket.
-    // Spawn a task to drain incoming events so Asterisk doesn't
-    // force-close the connection when its write buffer fills up.
+    // Signal readiness to slmodemd once this is up.
     let ari_events = ari.connect_events(&media_request.app).await?;
     let _ari_drain = tokio::spawn(drain_ari_events(ari_events));
+
+    // Signal to slmodemd that the audio path is ready.
+    // We write a single newline to the Unix socket. slmodemd will be
+    // blocking on a read until this arrives.
+    sl_stream.writable().await?;
+    sl_stream.try_write(b"\n")?;
+    info!("event=sent_ready_to_slmodemd");
 
     // Give Asterisk a moment to register the Stasis app before we start
     // creating channels for it.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Read the dial string from the socket.
+    // If started by ATZ, this will be empty. We will then wait for the real
+    // dial string from the ATDT command.
+    let mut dial_string = cfg.dial_string.clone();
+    let mut line = String::new();
+    let mut reader = tokio::io::BufReader::new(sl_stream);
+    
+    // Read first dial string (from startup)
+    reader.read_line(&mut line).await?;
+    dial_string = line.trim().to_string();
+    
+    while dial_string.is_empty() {
+        info!("event=waiting_for_dial_string");
+        line.clear();
+        reader.read_line(&mut line).await?;
+        dial_string = line.trim().to_string();
+    }
+    info!(dial = %dial_string, "event=received_dial_string");
+    session = Session::new(dial_string.clone());
+    let sl_stream = reader.into_inner();
 
     // Create the media channel and obtain its WebSocket URL first.
     let media_setup = ari.setup_media(&media_request).await?;
@@ -37,17 +65,9 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         .connect_media_websocket(&media_setup.media_websocket_url, cfg.connect_timeout)
         .await?;
 
-    // --- CRITICAL SYNC POINT ---
-    // Signal to slmodemd that the audio path is ready.
-    // We write a single newline to the Unix socket. slmodemd will be
-    // blocking on a read until this arrives.
-    sl_stream.writable().await?;
-    sl_stream.try_write(b"\n")?;
-    info!("event=sent_ready_to_slmodemd");
-
     // Now dial the outbound call and bridge the channels.
     let call = match ari
-        .dial_and_bridge(&cfg.dial_string, &media_request.app, &media_setup)
+        .dial_and_bridge(&dial_string, &media_request.app, &media_setup)
         .await
     {
         Ok(call) => call,
