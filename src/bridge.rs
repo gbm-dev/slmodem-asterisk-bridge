@@ -23,6 +23,10 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let ari_events = ari.connect_events(&media_request.app).await?;
     let _ari_drain = tokio::spawn(drain_ari_events(ari_events));
 
+    // Give Asterisk a moment to register the Stasis app before we start
+    // creating channels for it.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     // Create the media channel and obtain its WebSocket URL first.
     let media_setup = ari.setup_media(&media_request).await?;
     session.transition(SessionState::ConnectingMedia)?;

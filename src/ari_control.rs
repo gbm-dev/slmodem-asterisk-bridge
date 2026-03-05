@@ -5,7 +5,6 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
-use tokio_tungstenite::tungstenite;
 use tracing::{debug, warn};
 use url::Url;
 
@@ -60,8 +59,11 @@ impl AriController {
     pub async fn connect_events(
         &self,
         app: &str,
-    ) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
-    {
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
         let mut ws_url = self.path_url("/events")?;
         let scheme = match ws_url.scheme() {
             "http" => "ws",
@@ -71,17 +73,27 @@ impl AriController {
         ws_url
             .set_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("failed to convert ARI URL scheme to websocket"))?;
+
+        // Add credentials directly to the URL for Basic Auth.
+        // tungstenite uses this to generate the Authorization header automatically.
+        ws_url.set_username(&self.username).map_err(|_| {
+            anyhow::anyhow!("failed to set username in websocket URL")
+        })?;
+        ws_url.set_password(Some(&self.password)).map_err(|_| {
+            anyhow::anyhow!("failed to set password in websocket URL")
+        })?;
+
         ws_url
             .query_pairs_mut()
             .clear()
             .append_pair("app", app)
             .append_pair("subscribeAll", "true");
 
-        let request = self.authenticated_ws_request(ws_url.as_str())?;
-
-        let (stream, _resp) = tokio_tungstenite::connect_async(request)
+        let (stream, _resp) = tokio_tungstenite::connect_async(ws_url.as_str())
             .await
-            .context("failed to connect ARI events websocket")?;
+            .with_context(|| {
+                format!("failed to connect ARI events websocket to {ws_url}")
+            })?;
 
         debug!(app, url = %ws_url, "event=ari_events_connected");
         Ok(stream)
@@ -227,41 +239,6 @@ impl AriController {
         Ok(ws_url.to_string())
     }
 
-    /// Build an authenticated WebSocket request for the given URL.
-    fn authenticated_ws_request(
-        &self,
-        url: &str,
-    ) -> Result<tungstenite::http::Request<()>> {
-        let parsed = Url::parse(url)
-            .with_context(|| format!("invalid websocket URL: {url}"))?;
-
-        let auth = format!("{}:{}", self.username, self.password);
-        let auth_header = format!(
-            "Basic {}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &auth)
-        );
-
-        let host = parsed.host_str().unwrap_or("127.0.0.1").to_string();
-        let host_header = match parsed.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host,
-        };
-
-        tungstenite::http::Request::builder()
-            .uri(url)
-            .header("Host", &host_header)
-            .header("Authorization", &auth_header)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header(
-                "Sec-WebSocket-Key",
-                tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .with_context(|| format!("failed to build websocket request for {url}"))
-    }
-
     /// Connect to the media WebSocket with authentication.
     pub async fn connect_media_websocket(
         &self,
@@ -272,15 +249,28 @@ impl AriController {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     > {
-        let request = self.authenticated_ws_request(url)?;
+        let mut ws_url = Url::parse(url)
+            .with_context(|| format!("invalid media websocket URL: {url}"))?;
+
+        // Add credentials directly to the URL for Basic Auth.
+        ws_url.set_username(&self.username).map_err(|_| {
+            anyhow::anyhow!("failed to set username in media websocket URL")
+        })?;
+        ws_url.set_password(Some(&self.password)).map_err(|_| {
+            anyhow::anyhow!("failed to set password in media websocket URL")
+        })?;
 
         let (stream, _resp) = tokio::time::timeout(
             connect_timeout,
-            tokio_tungstenite::connect_async(request),
+            tokio_tungstenite::connect_async(ws_url.as_str()),
         )
         .await
-        .with_context(|| format!("timed out connecting to media websocket {url}"))?
-        .with_context(|| format!("failed connecting to media websocket {url}"))?;
+        .with_context(|| {
+            format!("timed out connecting to media websocket {url}")
+        })?
+        .with_context(|| {
+            format!("failed connecting to media websocket {url}")
+        })?;
 
         debug!(url, "event=media_ws_connected");
         Ok(stream)
