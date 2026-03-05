@@ -14,7 +14,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let mut session = Session::new(cfg.dial_string.clone());
     session.transition(SessionState::Originating)?;
 
-    let sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
+    let mut sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
     let ari = AriController::from_config(&cfg)?;
 
     // --- CRITICAL SYNC POINT ---
@@ -39,7 +39,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     // We send silence samples while waiting to keep slmodemd's DSP clock running.
     let (read_half, mut write_half) = sl_stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
-    let mut dial_string = String::new();
+    let dial_string;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
     let silence = [0u8; 384]; // 192 samples * 2 bytes (S16_LE) for 9600Hz
 
