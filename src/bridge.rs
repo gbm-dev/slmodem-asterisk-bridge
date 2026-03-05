@@ -19,8 +19,10 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let ari = AriController::from_config(&cfg)?;
 
     // Register the Stasis app by opening the ARI events WebSocket.
-    // This must stay open for the lifetime of the call.
-    let _ari_events = ari.connect_events(&media_request.app).await?;
+    // Spawn a task to drain incoming events so Asterisk doesn't
+    // force-close the connection when its write buffer fills up.
+    let ari_events = ari.connect_events(&media_request.app).await?;
+    let _ari_drain = tokio::spawn(drain_ari_events(ari_events));
 
     let call = ari.start_call(&cfg.dial_string, &media_request).await?;
     session.transition(SessionState::ConnectingMedia)?;
@@ -126,4 +128,19 @@ async fn relay_media_websocket(
     };
 
     tokio::try_join!(sl_to_ws, ws_to_sl).context("media relay failed")
+}
+
+async fn drain_ari_events(
+    stream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    let (_writer, mut reader) = stream.split();
+    while let Some(msg) = reader.next().await {
+        match msg {
+            Ok(Message::Close(_)) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
 }
