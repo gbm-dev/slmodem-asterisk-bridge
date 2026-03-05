@@ -175,7 +175,8 @@ mod tests {
         let pairs = req.query_pairs();
 
         assert!(pairs.contains(&("app".to_string(), "slmodem".to_string())));
-        assert!(pairs.contains(&("external_host".to_string(), "media_conn".to_string())));
+        // For server mode, external_host must be empty so Asterisk injects "INCOMING"
+        assert!(pairs.contains(&("external_host".to_string(), "".to_string())));
         assert!(pairs.contains(&("format".to_string(), "ulaw".to_string())));
         assert!(pairs.contains(&("transport".to_string(), "websocket".to_string())));
         assert!(pairs.contains(&("encapsulation".to_string(), "none".to_string())));
