@@ -331,6 +331,8 @@ impl AriController {
     }
 
     /// Connect to the media WebSocket with authentication.
+    /// Uses an explicit Authorization header because tokio-tungstenite's
+    /// connect_async ignores credentials embedded in the URL.
     pub async fn connect_media_websocket(
         &self,
         url: &str,
@@ -343,20 +345,29 @@ impl AriController {
         assert!(!url.is_empty(), "media websocket URL must not be empty");
         info!(url, timeout_ms = connect_timeout.as_millis(), "event=media_ws_connecting");
 
-        let mut ws_url = Url::parse(url)
+        let ws_url = Url::parse(url)
             .with_context(|| format!("invalid media websocket URL: {url}"))?;
 
-        // Add credentials directly to the URL for Basic Auth.
-        ws_url.set_username(&self.username).map_err(|_| {
-            anyhow::anyhow!("failed to set username in media websocket URL")
-        })?;
-        ws_url.set_password(Some(&self.password)).map_err(|_| {
-            anyhow::anyhow!("failed to set password in media websocket URL")
-        })?;
+        // Build request with explicit Basic Auth header, matching the
+        // approach used in connect_events(). connect_async does NOT
+        // extract userinfo from the URL into an Authorization header.
+        let auth = format!("{}:{}", self.username, self.password);
+        let auth_base64 = base64::engine::general_purpose::STANDARD.encode(auth);
+        let auth_header = format!("Basic {auth_base64}");
+
+        let request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
+            .uri(ws_url.as_str())
+            .header("Authorization", auth_header)
+            .header("Host", ws_url.host_str().unwrap_or("localhost"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+            .header("Sec-WebSocket-Version", "13")
+            .body(())?;
 
         let (stream, _resp) = tokio::time::timeout(
             connect_timeout,
-            tokio_tungstenite::connect_async(ws_url.as_str()),
+            tokio_tungstenite::connect_async(request),
         )
         .await
         .with_context(|| {
@@ -366,7 +377,7 @@ impl AriController {
             format!("failed connecting to media websocket {url}")
         })?;
 
-        debug!(url, "event=media_ws_connected");
+        info!(url, "event=media_ws_connected");
         Ok(stream)
     }
 
