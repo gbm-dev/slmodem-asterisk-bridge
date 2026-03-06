@@ -246,15 +246,18 @@ impl AriController {
             return Err(err);
         }
 
-        if let Err(err) = self
-            .wait_channel_up(&outbound_channel_id, self.originate_timeout)
-            .await
-        {
-            self.best_effort_hangup_channel(&outbound_channel_id).await;
-            self.best_effort_hangup_channel(&setup.media_channel_id).await;
-            self.best_effort_destroy_bridge(&setup.bridge_id).await;
-            return Err(err);
-        }
+        // No wait_channel_up: the media relay starts immediately so slmodemd
+        // receives early media (ringing, answer tones) needed for modem
+        // training detection. Without early media, slmodemd cannot detect the
+        // remote modem's 2100 Hz CED answer tone and training fails.
+        //
+        // Call failure (BUSY, NO ANSWER, 4xx) is detected when Asterisk closes
+        // the media WebSocket, which ends the relay naturally.
+        info!(
+            outbound_channel_id = %outbound_channel_id,
+            bridge_id = %setup.bridge_id,
+            "event=dial_and_bridge_complete"
+        );
 
         Ok(ActiveCall {
             bridge_id: setup.bridge_id.clone(),

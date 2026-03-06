@@ -1,6 +1,7 @@
 mod ari_control;
 mod ari_external_media;
 mod bridge;
+mod codec;
 mod config;
 mod dial_string;
 mod session;

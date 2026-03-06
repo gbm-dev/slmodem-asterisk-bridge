@@ -1,5 +1,6 @@
 use crate::ari_control::AriController;
 use crate::ari_external_media::ExternalMediaRequest;
+use crate::codec;
 use crate::config::Config;
 use crate::dial_string::DialString;
 use crate::session::{Session, SessionState};
@@ -8,7 +9,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum bytes a single line from slmodemd can be before we discard it.
 /// Dial strings are short (<128 chars); anything longer is garbled data.
@@ -34,10 +35,26 @@ const SILENCE_FRAME_BYTES: usize = 320;
 /// the codec frame duration so the DSP sees a steady sample clock.
 const SILENCE_INTERVAL_MS: u64 = 20;
 
-#[instrument(skip_all, fields(dial = %cfg.dial_string, media = %cfg.media_addr, fd = cfg.socket_fd))]
+/// How often to log relay throughput stats. 2 seconds is frequent enough
+/// to diagnose audio flow problems without flooding logs.
+const RELAY_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Safety limit on drain iterations during ARI setup. At 20 ms silence
+/// intervals, 500 iterations = 10 seconds — well beyond any ARI setup
+/// sequence. If we're still draining after this, something is stuck.
+const DRAIN_ITERATIONS_LIMIT: u32 = 500;
+
+#[allow(clippy::too_many_lines)]
 pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()> {
-    assert!(cfg.socket_fd >= 0, "socket fd must be non-negative, got {}", cfg.socket_fd);
-    assert!(!cfg.ari_base_url.is_empty(), "ARI base URL must not be empty");
+    assert!(
+        cfg.socket_fd >= 0,
+        "socket fd must be non-negative, got {}",
+        cfg.socket_fd
+    );
+    assert!(
+        !cfg.ari_base_url.is_empty(),
+        "ARI base URL must not be empty"
+    );
 
     info!(
         fd = cfg.socket_fd,
@@ -48,7 +65,6 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
     let sl_stream = socket_from_raw_fd(cfg.socket_fd)?;
     let ari = AriController::from_config(&cfg)?;
 
-    // --- CRITICAL SYNC POINT ---
     // Register the Stasis app by opening the ARI events WebSocket once.
     // Signal readiness to slmodemd only after this succeeds.
     info!("event=connecting_ari_events, reason=must register stasis app before signaling readiness");
@@ -58,8 +74,6 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
 
     // Signal to slmodemd that the audio path is ready.
     // 'R' = Ready. slmodemd blocks on socket_start() until it reads this byte.
-    // Without this signal, slmodemd's modem emulation is frozen — AT commands
-    // sent to /dev/ttySL0 will time out.
     let mut sl_stream = sl_stream;
     sl_stream.writable().await?;
     sl_stream.write_all(b"R").await?;
@@ -77,12 +91,10 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         info!(calls_count, "event=waiting_for_dial_string");
 
         let (mut read_half, mut write_half) = sl_stream.into_split();
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(SILENCE_INTERVAL_MS));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(SILENCE_INTERVAL_MS));
         let mut line_buf = Vec::with_capacity(LINE_BUF_LIMIT);
 
-        // Feed silence to slmodemd while waiting for a DIAL: command.
-        // We MUST drain read_half continuously to prevent slmodemd from
-        // blocking on write and deadlocking.
         let dial_string = wait_for_dial_string(
             &mut read_half,
             &mut write_half,
@@ -95,7 +107,6 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         let dial_string = match dial_string {
             Some(ds) => ds,
             None => {
-                // slmodemd closed the socket — clean shutdown.
                 info!("event=slmodemd_socket_closed, reason=normal shutdown, aborting ARI drain");
                 ari_drain.abort();
                 return Ok(());
@@ -103,9 +114,6 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         };
 
         calls_count += 1;
-        // slmodemd sends the raw ATDT string including the T/P prefix
-        // (e.g. "T17186945647"). Strip it so the SIP endpoint gets a
-        // clean phone number, not "PJSIP/T17186945647@telnyx-out".
         let dial_string = match DialString::parse(&dial_string) {
             Ok(parsed) => parsed.as_str().to_string(),
             Err(err) => {
@@ -120,41 +128,29 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
         let mut session = Session::new(dial_string.clone());
         session.transition(SessionState::Originating)?;
 
-        // Create the media channel and obtain its WebSocket URL.
-        let media_setup = match ari.setup_media(&media_request).await {
-            Ok(setup) => {
-                info!(
-                    bridge_id = %setup.bridge_id,
-                    media_channel_id = %setup.media_channel_id,
-                    "event=media_setup_complete"
-                );
-                setup
-            }
-            Err(err) => {
-                warn!(error = %err, dial = %dial_string, "event=media_setup_failed, returning to wait state");
-                sl_stream = read_half
-                    .reunite(write_half)
-                    .map_err(|_| anyhow::anyhow!("failed to reunite socket halves"))?;
-                continue;
-            }
+        // ARI setup with concurrent slmodemd drain.
+        //
+        // Why: slmodemd starts its DSP immediately after sending DIAL:. It
+        // writes modem tones to the socket and expects continuous received
+        // audio frames. Without draining, the socket buffer fills with stale
+        // audio that arrives as a burst when relay starts — corrupting modem
+        // training. Without silence feed, the DSP underruns and its internal
+        // timing drifts.
+        let setup_result = {
+            let setup_fut = ari_setup(
+                &ari,
+                &cfg,
+                &media_request,
+                &dial_string,
+                &mut session,
+            );
+            drain_during_ari_setup(&mut read_half, &mut write_half, &silence, setup_fut).await
         };
-        session.transition(SessionState::ConnectingMedia)?;
 
-        // Connect the media WebSocket (with auth).
-        let media_ws = match ari
-            .connect_media_websocket(&media_setup.media_websocket_url, cfg.connect_timeout)
-            .await
-        {
-            Ok(ws) => {
-                info!(
-                    url = %media_setup.media_websocket_url,
-                    "event=media_websocket_connected"
-                );
-                ws
-            }
+        let (media_ws, call) = match setup_result {
+            Ok(result) => result,
             Err(err) => {
-                warn!(error = %err, "event=media_websocket_connect_failed");
-                ari.cleanup_media(&media_setup).await;
+                warn!(error = %err, dial = %dial_string, "event=ari_setup_failed, returning to wait state");
                 sl_stream = read_half
                     .reunite(write_half)
                     .map_err(|_| anyhow::anyhow!("failed to reunite socket halves"))?;
@@ -162,30 +158,7 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
             }
         };
 
-        // Dial the outbound call and bridge the channels.
-        let call = match ari
-            .dial_and_bridge(&dial_string, &media_request.app, &media_setup)
-            .await
-        {
-            Ok(call) => {
-                info!(
-                    outbound_channel_id = %call.outbound_channel_id,
-                    bridge_id = %call.bridge_id,
-                    "event=dial_and_bridge_complete"
-                );
-                call
-            }
-            Err(err) => {
-                warn!(error = %err, dial = %dial_string, "event=dial_failed, returning to wait state");
-                ari.cleanup_media(&media_setup).await;
-                sl_stream = read_half
-                    .reunite(write_half)
-                    .map_err(|_| anyhow::anyhow!("failed to reunite socket halves"))?;
-                continue;
-            }
-        };
-
-        // Relay media between slmodemd and Asterisk.
+        // Full bidirectional relay with slin↔ulaw codec conversion.
         session.transition(SessionState::MediaActive)?;
         info!(dial = %session.dial(), state = ?session.state(), "event=bridge_start");
         let started = tokio::time::Instant::now();
@@ -213,11 +186,157 @@ pub async fn run(cfg: Config, media_request: ExternalMediaRequest) -> Result<()>
             }
         }
 
-        // Clean up Asterisk resources before next call.
         info!(dial = %dial_string, "event=teardown_start");
         ari.teardown(&call).await;
         info!(dial = %dial_string, "event=teardown_complete");
         session.transition(SessionState::Terminating)?;
+    }
+}
+
+/// Perform all ARI setup: create media channel, connect WebSocket, originate
+/// outbound call and bridge channels. Each step cleans up on failure.
+async fn ari_setup(
+    ari: &AriController,
+    cfg: &Config,
+    media_request: &ExternalMediaRequest,
+    dial_string: &str,
+    session: &mut Session,
+) -> Result<(
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    crate::ari_control::ActiveCall,
+)> {
+    let media_setup = match ari.setup_media(media_request).await {
+        Ok(setup) => {
+            info!(
+                bridge_id = %setup.bridge_id,
+                media_channel_id = %setup.media_channel_id,
+                "event=media_setup_complete"
+            );
+            setup
+        }
+        Err(err) => {
+            warn!(error = %err, dial = dial_string, "event=media_setup_failed");
+            return Err(err);
+        }
+    };
+    session.transition(SessionState::ConnectingMedia)?;
+
+    let media_ws = match ari
+        .connect_media_websocket(&media_setup.media_websocket_url, cfg.connect_timeout)
+        .await
+    {
+        Ok(ws) => {
+            info!(
+                url = %media_setup.media_websocket_url,
+                "event=media_websocket_connected"
+            );
+            ws
+        }
+        Err(err) => {
+            warn!(error = %err, "event=media_websocket_connect_failed");
+            ari.cleanup_media(&media_setup).await;
+            return Err(err);
+        }
+    };
+
+    let call = match ari
+        .dial_and_bridge(dial_string, &media_request.app, &media_setup)
+        .await
+    {
+        Ok(call) => {
+            info!(
+                outbound_channel_id = %call.outbound_channel_id,
+                bridge_id = %call.bridge_id,
+                "event=dial_and_bridge_complete"
+            );
+            call
+        }
+        Err(err) => {
+            warn!(error = %err, dial = dial_string, "event=dial_failed");
+            ari.cleanup_media(&media_setup).await;
+            return Err(err);
+        }
+    };
+
+    Ok((media_ws, call))
+}
+
+/// Drain slmodemd audio and feed silence while an async ARI setup runs.
+///
+/// slmodemd starts its DSP immediately after sending DIAL:. It writes modem
+/// tones to the socket and expects continuous received audio frames (20 ms
+/// cadence). This function keeps the DSP alive during ARI HTTP calls by:
+/// 1. Reading and discarding audio from slmodemd (prevents kernel buffer
+///    overflow and stale-audio burst when relay starts)
+/// 2. Writing silence frames every 20 ms (prevents DSP underrun and timing
+///    drift that would corrupt modem training)
+async fn drain_during_ari_setup<F, T>(
+    read_half: &mut tokio::net::unix::OwnedReadHalf,
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    silence: &[u8],
+    setup_fut: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    assert!(
+        silence.len() == SILENCE_FRAME_BYTES,
+        "silence must be {SILENCE_FRAME_BYTES} bytes"
+    );
+
+    tokio::pin!(setup_fut);
+
+    let mut drain_buf = [0u8; 2048];
+    let mut silence_interval =
+        tokio::time::interval(std::time::Duration::from_millis(SILENCE_INTERVAL_MS));
+    let mut drained_bytes: u64 = 0;
+    let mut iterations: u32 = 0;
+
+    loop {
+        assert!(
+            iterations < DRAIN_ITERATIONS_LIMIT,
+            "drain loop exceeded {DRAIN_ITERATIONS_LIMIT} iterations — ARI setup stuck"
+        );
+        iterations += 1;
+
+        tokio::select! {
+            result = &mut setup_fut => {
+                if drained_bytes > 0 {
+                    info!(
+                        drained_bytes,
+                        iterations,
+                        "event=drain_during_setup_complete"
+                    );
+                }
+                return result;
+            }
+            res = read_half.read(&mut drain_buf) => {
+                match res {
+                    Ok(0) => {
+                        return Err(anyhow::anyhow!(
+                            "slmodemd closed socket during ARI setup"
+                        ));
+                    }
+                    Ok(n) => {
+                        drained_bytes += n as u64;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "slmodemd read error during ARI setup: {e}"
+                        ));
+                    }
+                }
+            }
+            _ = silence_interval.tick() => {
+                if let Err(e) = write_half.write_all(silence).await {
+                    return Err(anyhow::anyhow!(
+                        "failed to write silence during ARI setup: {e}"
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -237,9 +356,9 @@ async fn wait_for_dial_string(
     );
 
     let mut buf = [0u8; 1024];
-    let mut heartbeat = tokio::time::interval(
-        std::time::Duration::from_secs(DIAL_WAIT_HEARTBEAT_SECS),
-    );
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(
+        DIAL_WAIT_HEARTBEAT_SECS,
+    ));
     // Skip the first immediate tick so the first heartbeat fires after the full interval.
     heartbeat.tick().await;
 
@@ -285,23 +404,26 @@ async fn wait_for_dial_string(
                 }
             }
             _ = interval.tick() => {
-                // Keep slmodemd DSP alive by providing a steady sample clock.
                 if let Err(e) = write_half.write_all(silence).await {
                     warn!(error = %e, "event=silence_write_failed, reason=socket closing");
                     return None;
                 }
             }
             _ = heartbeat.tick() => {
-                // Liveness heartbeat: confirms the bridge is alive and waiting.
-                // Without this, a long idle period produces zero log output,
-                // making it impossible to distinguish "waiting" from "stuck".
                 info!("event=dial_wait_heartbeat, reason=still waiting for DIAL command from slmodemd");
             }
         }
     }
 }
 
-/// Bidirectional media relay between slmodemd unix socket and Asterisk media WebSocket.
+/// Bidirectional media relay between slmodemd unix socket and Asterisk media
+/// WebSocket, with slin↔ulaw codec conversion.
+///
+/// slmodemd speaks signed 16-bit linear PCM (S16_LE, 8 kHz). Asterisk's
+/// ExternalMedia WebSocket is configured for ulaw (G.711 µ-law). Converting
+/// here lets Asterisk's bridge use proxy_media mode (true passthrough, no
+/// transcoding) which gives the cleanest audio path for modem training.
+///
 /// Returns the reunited unix stream and byte counts for each direction.
 async fn relay_media(
     sl_stream: tokio::net::UnixStream,
@@ -314,16 +436,18 @@ async fn relay_media(
 
     info!("event=relay_media_start");
 
-    /// How often to log relay throughput stats. 2 seconds is frequent enough
-    /// to diagnose audio flow problems without flooding logs.
-    const RELAY_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
+    // sl→ws: read slin from slmodemd, convert to ulaw, send to Asterisk.
     let sl_to_ws = async {
         let mut total: u64 = 0;
         let mut interval_bytes: u64 = 0;
         let mut frames: u64 = 0;
         let mut last_report = tokio::time::Instant::now();
         let mut buf = [0u8; 2048];
+        // Residual byte from a previous read that split mid-sample. In
+        // practice this never happens (slmodemd writes 320-byte frames),
+        // but we handle it for correctness.
+        let mut residual: Option<u8> = None;
+
         loop {
             let n = sl_reader
                 .read(&mut buf)
@@ -334,11 +458,19 @@ async fn relay_media(
                 let _ = ws_writer.send(Message::Close(None)).await;
                 break;
             }
-            total += n as u64;
-            interval_bytes += n as u64;
+
+            let slin = codec::align_slin_buffer(&mut residual, &buf[..n]);
+            if slin.is_empty() {
+                continue;
+            }
+
+            let ulaw = codec::encode_ulaw(&slin);
+            total += ulaw.len() as u64;
+            interval_bytes += ulaw.len() as u64;
             frames += 1;
+
             ws_writer
-                .send(Message::Binary(buf[..n].to_vec().into()))
+                .send(Message::Binary(ulaw.into()))
                 .await
                 .context("failed writing modem audio to media websocket")?;
 
@@ -360,6 +492,7 @@ async fn relay_media(
         Result::<u64>::Ok(total)
     };
 
+    // ws→sl: read ulaw from Asterisk, convert to slin, write to slmodemd.
     let ws_to_sl = async {
         let mut total: u64 = 0;
         let mut interval_bytes: u64 = 0;
@@ -367,6 +500,7 @@ async fn relay_media(
         let mut min_frame: usize = usize::MAX;
         let mut max_frame: usize = 0;
         let mut last_report = tokio::time::Instant::now();
+
         while let Some(frame) = ws_reader.next().await {
             let frame = frame.context("failed reading from media websocket")?;
             match frame {
@@ -377,8 +511,11 @@ async fn relay_media(
                     frames += 1;
                     min_frame = min_frame.min(len);
                     max_frame = max_frame.max(len);
+
+                    // Convert ulaw from Asterisk to slin for slmodemd's DSP.
+                    let slin = codec::decode_ulaw(&data);
                     sl_writer
-                        .write_all(&data)
+                        .write_all(&slin)
                         .await
                         .context("failed writing media audio to slmodemd socket")?;
 
@@ -406,7 +543,14 @@ async fn relay_media(
                     break;
                 }
                 Message::Text(text) => {
-                    warn!(text = %text, "event=unexpected_text_frame_on_media_ws");
+                    // Asterisk's WebSocket channel driver sends a MEDIA_START
+                    // text frame on connection with format, ptime, and
+                    // optimal frame size. Log it for diagnostics.
+                    if text.contains("MEDIA_START") {
+                        info!(media_start = %text, "event=media_start_received");
+                    } else {
+                        warn!(text = %text, "event=unexpected_text_frame_on_media_ws");
+                    }
                 }
                 Message::Ping(_) | Message::Pong(_) => {}
                 _ => {
@@ -474,8 +618,6 @@ async fn drain_ari_events(
                 break;
             }
             Ok(Message::Text(text)) => {
-                // ARI events are JSON text frames. Log at debug level so
-                // operators can enable verbose tracing without code changes.
                 debug!(event_text = %text, "event=ari_event_received");
             }
             Err(err) => {
@@ -501,8 +643,18 @@ mod tests {
 
     #[test]
     fn calls_limit_is_reasonable() {
-        // Must be large enough for any realistic session but bounded.
         assert!(CALLS_LIMIT >= 100, "calls limit too low for realistic use");
         assert!(CALLS_LIMIT <= 10_000, "calls limit unreasonably high");
+    }
+
+    #[test]
+    fn drain_iterations_limit_covers_setup_window() {
+        // At 20ms per iteration, the limit should cover at least 5 seconds
+        // of ARI setup time.
+        let coverage_ms = DRAIN_ITERATIONS_LIMIT as u64 * SILENCE_INTERVAL_MS;
+        assert!(
+            coverage_ms >= 5000,
+            "drain limit only covers {coverage_ms}ms, need at least 5000ms"
+        );
     }
 }
