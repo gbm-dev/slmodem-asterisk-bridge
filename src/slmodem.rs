@@ -1,10 +1,17 @@
 use anyhow::{Context, Result};
 use std::os::fd::FromRawFd;
+use tracing::info;
+
+/// Maximum fd value we accept. Linux's default limit is 1024 for unprivileged
+/// processes; slmodemd typically passes fd 3 or 4. Anything above 4096 is
+/// almost certainly a bug (garbled args, wrong fd inheritance).
+const FD_LIMIT: i32 = 4096;
 
 pub fn socket_from_raw_fd(fd: i32) -> Result<tokio::net::UnixStream> {
-    if fd < 0 {
-        anyhow::bail!("invalid socket fd: {fd}");
-    }
+    assert!(fd >= 0, "socket fd must be non-negative, got {fd}");
+    assert!(fd < FD_LIMIT, "socket fd {fd} exceeds limit {FD_LIMIT} — likely garbled args from slmodemd");
+
+    info!(fd, "event=converting_raw_fd_to_unix_stream");
 
     let std_stream = unsafe {
         // slmodemd passes an owned fd for this child process.
@@ -15,8 +22,11 @@ pub fn socket_from_raw_fd(fd: i32) -> Result<tokio::net::UnixStream> {
         .set_nonblocking(true)
         .context("failed to set slmodemd socket to nonblocking")?;
 
-    tokio::net::UnixStream::from_std(std_stream)
-        .context("failed to convert slmodemd fd to tokio stream")
+    let stream = tokio::net::UnixStream::from_std(std_stream)
+        .context("failed to convert slmodemd fd to tokio stream")?;
+
+    info!(fd, "event=unix_stream_ready");
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -25,7 +35,7 @@ mod tests {
 
     #[test]
     fn rejects_negative_fd() {
-        let err = socket_from_raw_fd(-1).expect_err("negative fd must fail");
-        assert!(err.to_string().contains("invalid socket fd"));
+        let result = std::panic::catch_unwind(|| socket_from_raw_fd(-1));
+        assert!(result.is_err(), "negative fd must panic via assertion");
     }
 }

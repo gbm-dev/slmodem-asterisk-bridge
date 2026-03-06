@@ -6,7 +6,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -21,7 +21,6 @@ pub struct ActiveCall {
     pub bridge_id: String,
     pub outbound_channel_id: String,
     pub media_channel_id: String,
-    pub media_websocket_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +35,9 @@ pub struct AriController {
 
 impl AriController {
     pub fn from_config(cfg: &Config) -> Result<Self> {
+        assert!(!cfg.ari_base_url.is_empty(), "ARI base URL must not be empty");
+        assert!(!cfg.ari_username.is_empty(), "ARI username must not be empty");
+
         // Url::join replaces the last path segment unless the base ends with '/'.
         // Ensure trailing slash so "/ari" + "bridges" = "/ari/bridges", not "/bridges".
         let mut base = cfg.ari_base_url.clone();
@@ -44,6 +46,9 @@ impl AriController {
         }
         let base_url =
             Url::parse(&base).with_context(|| format!("invalid ARI URL {}", cfg.ari_base_url))?;
+
+        info!(base_url = %base_url, "event=ari_controller_created");
+
         Ok(Self {
             client: reqwest::Client::new(),
             base_url,
@@ -95,27 +100,49 @@ impl AriController {
             .header("Sec-WebSocket-Version", "13")
             .body(())?;
 
-        let max_retries = 5;
-        let mut attempt = 0;
+        // Asterisk may still be starting when the bridge is spawned.
+        // Use enough retries with exponential backoff to survive the
+        // typical 5-15 second Asterisk startup window. 20 retries with
+        // 500 ms base and 2x backoff capped at 5 s gives ~60 s total.
+        let max_retries: u32 = 20;
+        let backoff_base_ms: u64 = 500;
+        let backoff_cap = Duration::from_secs(5);
+        let mut attempt: u32 = 0;
+
+        info!(
+            url = %ws_url,
+            app,
+            max_retries,
+            backoff_base_ms,
+            "event=ari_events_connecting, reason=registering stasis app with asterisk"
+        );
+
         loop {
             match tokio_tungstenite::connect_async(request.clone()).await {
                 Ok((stream, _resp)) => {
-                    debug!(app, url = %ws_url, "event=ari_events_connected");
+                    debug!(app, url = %ws_url, attempt, "event=ari_events_connected");
                     return Ok(stream);
                 }
                 Err(err) => {
                     attempt += 1;
                     if attempt >= max_retries {
                         return Err(anyhow::anyhow!(err))
-                            .with_context(|| format!("failed to connect ARI events websocket to {ws_url} after {max_retries} attempts"));
+                            .with_context(|| format!(
+                                "failed to connect ARI events websocket to {ws_url} after {max_retries} attempts"
+                            ));
                     }
+                    let multiplier = 1u32.checked_shl(attempt.min(10)).unwrap_or(u32::MAX);
+                    let delay = Duration::from_millis(backoff_base_ms)
+                        .saturating_mul(multiplier)
+                        .min(backoff_cap);
                     warn!(
                         error = %err,
                         attempt,
                         max_retries,
+                        delay_ms = delay.as_millis(),
                         "event=ari_events_connect_retry",
                     );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -128,10 +155,17 @@ impl AriController {
         &self,
         media_req: &ExternalMediaRequest,
     ) -> Result<MediaSetup> {
+        assert!(!media_req.app.is_empty(), "stasis app name must not be empty");
         self.validate_media_mode(media_req)?;
 
         let bridge_id = unique_id("slmodem-bridge");
         let media_channel_id = unique_id("slmodem-media");
+
+        info!(
+            bridge_id = %bridge_id,
+            media_channel_id = %media_channel_id,
+            "event=setup_media_start"
+        );
 
         self.create_bridge(&bridge_id).await?;
         if let Err(err) = self
@@ -176,7 +210,17 @@ impl AriController {
         app: &str,
         setup: &MediaSetup,
     ) -> Result<ActiveCall> {
+        assert!(!dial.is_empty(), "dial string must not be empty");
         let outbound_channel_id = unique_id("slmodem-out");
+        let endpoint = self.endpoint_from_dial(dial);
+
+        info!(
+            dial,
+            endpoint = %endpoint,
+            outbound_channel_id = %outbound_channel_id,
+            bridge_id = %setup.bridge_id,
+            "event=dial_and_bridge_start"
+        );
 
         if let Err(err) = self
             .create_and_dial_outbound(dial, &outbound_channel_id, app)
@@ -214,18 +258,43 @@ impl AriController {
             bridge_id: setup.bridge_id.clone(),
             outbound_channel_id,
             media_channel_id: setup.media_channel_id.clone(),
-            media_websocket_url: setup.media_websocket_url.clone(),
         })
     }
 
+    /// Clean up a media setup that never progressed to a full call.
+    /// Hangs up the media channel and destroys the bridge.
+    pub async fn cleanup_media(&self, setup: &MediaSetup) {
+        info!(
+            media_channel_id = %setup.media_channel_id,
+            bridge_id = %setup.bridge_id,
+            "event=cleanup_media_start"
+        );
+        self.best_effort_hangup_channel(&setup.media_channel_id)
+            .await;
+        self.best_effort_destroy_bridge(&setup.bridge_id).await;
+        info!("event=cleanup_media_complete");
+    }
+
+    /// Tear down all resources for a completed call: outbound channel,
+    /// media channel, and Asterisk bridge.
     pub async fn teardown(&self, call: &ActiveCall) {
+        info!(
+            outbound_channel_id = %call.outbound_channel_id,
+            media_channel_id = %call.media_channel_id,
+            bridge_id = %call.bridge_id,
+            "event=teardown_ari_resources"
+        );
         self.best_effort_hangup_channel(&call.outbound_channel_id)
             .await;
         self.best_effort_hangup_channel(&call.media_channel_id)
             .await;
         self.best_effort_destroy_bridge(&call.bridge_id).await;
+        info!("event=teardown_ari_complete");
     }
 
+    /// Only websocket/none/server mode is implemented. Other combinations
+    /// (UDP+RTP, AudioSocket) would require different relay logic in bridge.rs.
+    /// Fail fast here rather than producing a confusing Asterisk 4xx later.
     fn validate_media_mode(&self, media_req: &ExternalMediaRequest) -> Result<()> {
         let is_supported = media_req.transport == Transport::WebSocket
             && media_req.encapsulation == Encapsulation::None
@@ -271,6 +340,9 @@ impl AriController {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     > {
+        assert!(!url.is_empty(), "media websocket URL must not be empty");
+        info!(url, timeout_ms = connect_timeout.as_millis(), "event=media_ws_connecting");
+
         let mut ws_url = Url::parse(url)
             .with_context(|| format!("invalid media websocket URL: {url}"))?;
 
@@ -388,11 +460,18 @@ impl AriController {
     }
 
     async fn wait_channel_up(&self, channel_id: &str, timeout: Duration) -> Result<()> {
+        debug!(channel_id, timeout_ms = timeout.as_millis(), "event=wait_channel_up_start");
         let start = Instant::now();
         while start.elapsed() <= timeout {
             match self.get_channel_state(channel_id).await? {
-                Some(state) if state.eq_ignore_ascii_case("up") => return Ok(()),
-                Some(_) => sleep(Duration::from_millis(150)).await,
+                Some(state) if state.eq_ignore_ascii_case("up") => {
+                    info!(channel_id, elapsed_ms = start.elapsed().as_millis(), "event=channel_up");
+                    return Ok(());
+                }
+                Some(state) => {
+                    debug!(channel_id, state = %state, "event=channel_not_yet_up");
+                    sleep(Duration::from_millis(150)).await;
+                }
                 None => bail!("outbound channel {channel_id} disappeared before answer"),
             }
         }
@@ -406,9 +485,11 @@ impl AriController {
         variable: &str,
         timeout: Duration,
     ) -> Result<String> {
+        debug!(channel_id, variable, timeout_ms = timeout.as_millis(), "event=wait_for_variable_start");
         let start = Instant::now();
         while start.elapsed() <= timeout {
             if let Some(value) = self.get_channel_variable(channel_id, variable).await? {
+                info!(channel_id, variable, value = %value, "event=variable_resolved");
                 return Ok(value);
             }
             sleep(Duration::from_millis(100)).await;
