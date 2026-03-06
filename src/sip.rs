@@ -178,6 +178,7 @@ impl SipClient {
         // Parse WWW-Authenticate and build authenticated REGISTER
         let auth_header = extract_header(&resp, "WWW-Authenticate")
             .ok_or_else(|| anyhow::anyhow!("401 response missing WWW-Authenticate header"))?;
+        debug!(www_authenticate = %auth_header, "event=register_401_challenge");
 
         let digest = parse_digest_challenge(&auth_header)?;
         let response = compute_digest_response(
@@ -248,6 +249,7 @@ impl SipClient {
                 info!("event=register_success");
                 return Ok(());
             } else {
+                debug!(response = %resp2, "event=register_auth_rejected");
                 bail!(
                     "authenticated REGISTER failed with status {}",
                     status2.unwrap_or(0)
