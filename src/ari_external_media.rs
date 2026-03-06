@@ -69,7 +69,7 @@ impl ExternalMediaRequest {
         Self {
             app: app.into(),
             external_host: external_host.into(),
-            format: "ulaw".to_string(),
+            format: "slin".to_string(),
             transport: Transport::WebSocket,
             encapsulation: Encapsulation::None,
             connection_type: "server".to_string(),
@@ -83,7 +83,7 @@ impl ExternalMediaRequest {
         let app = std::env::var("ARI_APP").unwrap_or_else(|_| "slmodem".to_string());
         let external_host =
             std::env::var("ARI_EXTERNAL_HOST").unwrap_or_else(|_| "INCOMING".to_string());
-        let format = std::env::var("ARI_MEDIA_FORMAT").unwrap_or_else(|_| "ulaw".to_string());
+        let format = std::env::var("ARI_MEDIA_FORMAT").unwrap_or_else(|_| "slin".to_string());
 
         let transport = std::env::var("ARI_MEDIA_TRANSPORT")
             .ok()
@@ -164,7 +164,7 @@ mod tests {
         let req = ExternalMediaRequest::recommended_websocket("slmodem", "media_conn");
         assert_eq!(req.transport, Transport::WebSocket);
         assert_eq!(req.encapsulation, Encapsulation::None);
-        assert_eq!(req.format, "ulaw");
+        assert_eq!(req.format, "slin");
         assert_eq!(req.connection_type, "server");
         assert_eq!(req.transport_data.as_deref(), Some("f(json)"));
     }
@@ -177,7 +177,7 @@ mod tests {
         assert!(pairs.contains(&("app".to_string(), "slmodem".to_string())));
         // For server mode, external_host must be empty so Asterisk injects "INCOMING"
         assert!(pairs.contains(&("external_host".to_string(), "".to_string())));
-        assert!(pairs.contains(&("format".to_string(), "ulaw".to_string())));
+        assert!(pairs.contains(&("format".to_string(), "slin".to_string())));
         assert!(pairs.contains(&("transport".to_string(), "websocket".to_string())));
         assert!(pairs.contains(&("encapsulation".to_string(), "none".to_string())));
         assert!(pairs.contains(&("transport_data".to_string(), "f(json)".to_string())));

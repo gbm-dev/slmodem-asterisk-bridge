@@ -25,10 +25,10 @@ const CALLS_LIMIT: u32 = 1000;
 /// log spam, short enough to confirm the process isn't stuck.
 const DIAL_WAIT_HEARTBEAT_SECS: u64 = 60;
 
-/// 192 samples * 2 bytes (S16_LE) at 9600 Hz = one 20 ms frame of silence.
+/// 160 samples * 2 bytes (S16_LE) at 8000 Hz = one 20 ms frame of silence.
 /// slmodemd's DSP expects a continuous clock of audio frames; starving it
 /// causes internal buffer underruns that corrupt modem training sequences.
-const SILENCE_FRAME_BYTES: usize = 384;
+const SILENCE_FRAME_BYTES: usize = 320;
 
 /// Interval between silence frames sent to slmodemd while idle. 20 ms matches
 /// the codec frame duration so the DSP sees a steady sample clock.
@@ -444,8 +444,8 @@ mod tests {
 
     #[test]
     fn silence_frame_size_matches_codec_frame() {
-        // 192 samples * 2 bytes/sample (S16_LE) = 384 bytes per 20ms frame at 9600 Hz.
-        assert_eq!(SILENCE_FRAME_BYTES, 384);
+        // 160 samples * 2 bytes/sample (S16_LE) = 320 bytes per 20ms frame at 8000 Hz.
+        assert_eq!(SILENCE_FRAME_BYTES, 320);
     }
 
     #[test]
